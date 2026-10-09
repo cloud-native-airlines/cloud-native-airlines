@@ -1,0 +1,76 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: adsb
+      POSTGRES_USER: adsb
+      POSTGRES_PASSWORD: adsb
+    volumes:
+      - adsb-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U adsb -d adsb"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  adsb:
+    image: cloud-native-airlines/adsb:local
+    build:
+      context: ${ADSB_SOURCE:-../adsb}
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgres://adsb:adsb@postgres:5432/adsb?sslmode=disable
+      LISTEN_ADDR: 0.0.0.0:8080
+    ports:
+      - "127.0.0.1:${ADSB_PORT:-18080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  nats:
+    image: nats:2.10-alpine
+    # -m 8222 enables the HTTP monitoring endpoint (http://localhost:8222).
+    command: ["-m", "8222"]
+    ports:
+      - "127.0.0.1:${NATS_PORT:-4222}:4222"
+      - "127.0.0.1:${NATS_MONITOR_PORT:-8222}:8222"
+
+  simulator:
+    image: cloud-native-airlines/simulator:local
+    build:
+      context: ${SIM_SOURCE:-../simulator}
+      dockerfile: Dockerfile
+    environment:
+      # Starts paused: open the UI and press play to run the simulation.
+      SIM_START_PAUSED: "true"
+      SIM_START_TIME: "2026-10-06T14:00:00Z"
+      SIM_CLOCK_SPEED: "60"
+      SIM_TICK_INTERVAL: "1.0"
+      NATS_URL: nats://nats:4222
+      SIM_TICK_SUBJECT: cna.sim.tick
+    ports:
+      - "127.0.0.1:${SIM_PORT:-8000}:8000"
+    depends_on:
+      - nats
+
+  flight:
+    image: cloud-native-airlines/flight:local
+    build:
+      context: ${FLIGHT_SOURCE:-../flight}
+      dockerfile: Dockerfile
+    environment:
+      # Plan is baked into the image at /scenarios/msp-ord.json.
+      NATS_URL: nats://nats:4222
+      SIM_TICK_SUBJECT: cna.sim.tick
+      ADSB_URL: http://adsb:8080
+    ports:
+      - "127.0.0.1:${FLIGHT_PORT:-8081}:8080"
+    # A flight runs one leg and exits on landing; don't restart it.
+    restart: "no"
+    depends_on:
+      - nats
+      - adsb
+
+volumes:
+  adsb-postgres:
