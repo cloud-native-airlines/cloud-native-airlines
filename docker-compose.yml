@@ -58,23 +58,39 @@ services:
     depends_on:
       - nats
 
-  flight:
-    image: cloud-native-airlines/flight:local
+  operations-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: operations
+      POSTGRES_USER: operations
+      POSTGRES_PASSWORD: operations
+    volumes:
+      - operations-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U operations -d operations"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  operations:
+    image: cloud-native-airlines/operations:local
     build:
-      context: ${FLIGHT_SOURCE:-../flight}
+      context: ${OPERATIONS_SOURCE:-../operations}
       dockerfile: Dockerfile
     environment:
-      # Plan is baked into the image at /scenarios/msp-ord.json.
-      NATS_URL: nats://nats:4222
-      SIM_TICK_SUBJECT: cna.sim.tick
-      ADSB_URL: http://adsb:8080
+      DATABASE_URL: jdbc:postgresql://operations-postgres:5432/operations
+      DB_USER: operations
+      DB_PASSWORD: operations
+      # Supplies the default run_id + simulated time when a request omits them.
+      SIMULATOR_URL: http://simulator:8000
     ports:
-      - "127.0.0.1:${FLIGHT_PORT:-8081}:8080"
-    # A flight runs one leg and exits on landing; don't restart it.
-    restart: "no"
+      - "127.0.0.1:${OPERATIONS_PORT:-18082}:8080"
     depends_on:
-      - nats
-      - adsb
+      operations-postgres:
+        condition: service_healthy
+      simulator:
+        condition: service_started
 
   flight-tracker:
     image: cloud-native-airlines/flight-tracker:local
@@ -87,5 +103,54 @@ services:
       - nats
       - adsb
 
+  # Built so the dispatcher can launch one container per leg; never started as a
+  # long-running service (the profile keeps it out of `up`). `docker compose
+  # build` still builds it.
+  flight:
+    image: cloud-native-airlines/flight:local
+    build:
+      context: ${FLIGHT_SOURCE:-../flight}
+      dockerfile: Dockerfile
+    profiles: ["build-only"]
+
+  dispatcher:
+    image: cloud-native-airlines/dispatcher:local
+    build:
+      context: ${DISPATCHER_SOURCE:-../dispatcher}
+      dockerfile: Dockerfile
+    environment:
+      NATS_URL: nats://nats:4222
+      SIM_TICK_SUBJECT: cna.sim.tick
+      SIM_URL: http://simulator:8000
+      OPERATIONS_URL: http://operations:8080
+      ADSB_URL: http://adsb:8080
+      AIRCRAFT_ID: N100CA
+      # Image the dispatcher launches per leg, and the network it attaches those
+      # containers to so they resolve nats/adsb/operations by name.
+      FLIGHT_IMAGE: cloud-native-airlines/flight:local
+      FLIGHT_NETWORK: cloud-native-airlines
+      FLIGHT_AUTOREMOVE: "false"
+    # Launches Flight containers through the host Docker daemon.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:${DISPATCHER_PORT:-18083}:8080"
+    depends_on:
+      nats:
+        condition: service_started
+      adsb:
+        condition: service_started
+      simulator:
+        condition: service_started
+      operations:
+        condition: service_started
+
 volumes:
   adsb-postgres:
+  operations-postgres:
+
+# Fixed network name so the dispatcher can attach launched Flight containers to
+# it regardless of the compose project name.
+networks:
+  default:
+    name: cloud-native-airlines
